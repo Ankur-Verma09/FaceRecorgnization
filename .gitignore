@@ -1,0 +1,45 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime cache and generated application data
+.cache/
+_Organized/
+
+# Downloaded AI model binaries (downloaded automatically at runtime)
+backend/models_onnx/
+
+# Frontend dependencies and generated assets
+frontend/node_modules/
+frontend/dist/
+
+# Packaging and installer outputs
+build/
+dist/
+installer_output/
+
+# Generated/sample photo folders
+test_organized_photos/
+test_photos_organized/
+test_photos_sample/
+test_sample_photos/
+
+# Test and coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
