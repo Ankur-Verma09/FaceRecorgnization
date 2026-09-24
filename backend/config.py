@@ -42,3 +42,19 @@ DEFAULT_COSINE_THRESHOLD = 0.48
 DEFAULT_GROUP_THRESHOLD = 3      # Primary faces >= 3 categorized as group photos
 PRIMARY_FACE_AREA_THRESHOLD = 0.006 # Faces smaller than 0.6% of total photo area are treated as background crowd
 BLUR_SHARPNESS_THRESHOLD = 45.0 # Laplacian variance below 45 is flagged as blurry/out of focus
+
+# ── Phase 1: Embedding Quality Gate ──
+# Faces below these thresholds are stored but excluded from clustering to prevent noise
+MIN_FACE_SIZE_FOR_EMBEDDING = 48      # Minimum bbox width/height in original-image pixels
+MIN_CONFIDENCE_FOR_CLUSTERING = 0.75  # Detection confidence floor for cluster-eligible faces
+MIN_SHARPNESS_FOR_CLUSTERING = 40.0   # Aligned-crop Laplacian variance floor
+
+# ── Phase 2: Multi-Scale Detection ──
+DETECTION_SCALES = [1280, 1920]       # Run YuNet at each of these max-dimension caps
+DETECTION_SCALES_LARGE = 2560         # Additional scale for images wider than 4000px
+DETECTION_IOU_DEDUP_THRESHOLD = 0.50  # IoU overlap threshold for deduplicating cross-scale detections
+
+# ── Phase 3: Adaptive Clustering ──
+TIGHT_CLUSTER_THRESHOLD = 0.38       # Pass 1: high-purity micro-clusters
+MAX_CENTROID_MERGE_THRESHOLD = 0.60  # Pass 2: max allowed centroid distance for merging
+MIN_PAIRWISE_SAFETY_THRESHOLD = 0.55 # Pass 2: safety check — min distance between any face pair across clusters

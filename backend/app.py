@@ -28,7 +28,7 @@ app = FastAPI(title="Offline AI Face Recognition & Photo Organizer API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000", "http://127.0.0.1:5173", "http://localhost", "http://127.0.0.1"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,6 +56,8 @@ class ConnectionManager:
 ws_manager = ConnectionManager()
 
 import uuid
+
+job_lock = asyncio.Lock()
 
 # Pydantic Schemas
 class ScanRequest(BaseModel):
@@ -168,8 +170,15 @@ def run_export_job(req: OrganizeRequest, loop):
     )
     export_status_state["manifest_id"] = res.get("manifest_id")
 
+async def _async_scan_job(source_dir, library_name, loop):
+    async with job_lock:
+        await loop.run_in_executor(None, run_scan_job, source_dir, library_name, loop)
+
 @app.post("/api/scan/start")
 async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
+    if job_lock.locked():
+        raise HTTPException(status_code=409, detail="A scan or export job is currently in progress.")
+        
     if not os.path.exists(req.source_dir):
         raise HTTPException(status_code=400, detail=f"Source directory '{req.source_dir}' does not exist.")
 
@@ -179,7 +188,7 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
     scan_status_state["message"] = ""
 
     loop = asyncio.get_event_loop()
-    background_tasks.add_task(run_scan_job, req.source_dir, req.library_name or "", loop)
+    background_tasks.add_task(_async_scan_job, req.source_dir, req.library_name or "", loop)
     return {"status": "started", "source_dir": req.source_dir}
 
 @app.get("/api/dashboard/insights")
@@ -205,6 +214,22 @@ async def get_scan_status():
 async def list_persons():
     persons = db_manager.get_all_persons()
     return persons
+
+from pydantic import BaseModel
+class CreatePersonReq(BaseModel):
+    display_name: str
+
+import uuid
+@app.post("/api/persons/create")
+async def create_person(req: CreatePersonReq):
+    new_id = str(uuid.uuid4())
+    db_manager.save_person(new_id, req.display_name, "", 0)
+    return {"person_id": new_id, "display_name": req.display_name}
+
+@app.get("/api/persons/{person_id}/images")
+async def get_person_images(person_id: str):
+    images = db_manager.get_images_for_person(person_id)
+    return images
 
 @app.get("/api/images")
 async def list_images():
@@ -301,18 +326,29 @@ async def delete_face(req: DeleteFaceRequest):
     db_manager.delete_face(req.face_id)
     return {"success": True}
 
+async def _async_export_job(req, loop):
+    async with job_lock:
+        await loop.run_in_executor(None, run_export_job, req, loop)
+
 @app.post("/api/organize/execute")
 async def execute_organize(req: OrganizeRequest, background_tasks: BackgroundTasks):
+    if job_lock.locked():
+        raise HTTPException(status_code=409, detail="A scan or export job is currently in progress.")
+
     export_status_state["status"] = "exporting"
     export_status_state["exported_count"] = 0
 
     loop = asyncio.get_event_loop()
-    background_tasks.add_task(run_export_job, req, loop)
+    background_tasks.add_task(_async_export_job, req, loop)
     return {"status": "started", "target_dir": req.target_dir}
 
 @app.get("/api/organize/status")
 async def get_export_status():
     return export_status_state
+
+@app.get("/api/organize/manifests")
+async def get_manifests():
+    return db_manager.get_all_manifests()
 
 @app.post("/api/organize/undo")
 async def undo_organize(req: UndoRequest):
@@ -342,13 +378,13 @@ async def select_folder_api(title: str = "Select Directory"):
 @app.post("/api/utils/open_folder")
 async def open_folder_api(req: Dict[str, str]):
     folder_path = req.get("path", "")
-    if folder_path and os.path.exists(folder_path):
+    if folder_path and os.path.isdir(folder_path):
         try:
             os.startfile(folder_path)
             return {"success": True}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-    raise HTTPException(status_code=400, detail="Folder path does not exist.")
+    raise HTTPException(status_code=400, detail="Folder path does not exist or is not a directory.")
 
 @app.get("/api/person_thumbnail/{person_id}")
 async def get_person_thumbnail(person_id: str):
@@ -383,7 +419,25 @@ async def get_thumbnail(face_id: str):
 
 @app.get("/api/image")
 async def get_image(path: str):
-    p = Path(path)
+    p = Path(path).resolve()
+    
+    is_valid = False
+    try:
+        if CACHE_DIR.resolve() in p.parents or THUMBNAILS_DIR.resolve() in p.parents:
+            is_valid = True
+    except Exception:
+        pass
+        
+    if not is_valid:
+        conn = db_manager.get_connection()
+        cur = conn.execute("SELECT 1 FROM images WHERE file_path = ?", (str(p),))
+        if cur.fetchone():
+            is_valid = True
+        conn.close()
+        
+    if not is_valid:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     if p.exists() and p.is_file():
         return FileResponse(str(p))
     raise HTTPException(status_code=404, detail="Image file not found")

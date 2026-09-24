@@ -41,34 +41,57 @@ export default function App() {
     operationMode: 'copy'
   })
 
+  const [manifests, setManifests] = useState([])
+
   // WebSocket for real-time scan and export progress stream
   useEffect(() => {
+    let ws
+    let reconnectTimer
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const wsUrl = `${wsProtocol}//${window.location.host}/ws/progress`
-    
-    let ws
-    try {
-      ws = new WebSocket(wsUrl)
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data)
-        if (data.status === 'exporting' || data.status === 'export_completed') {
-          setExportStatus(data)
-          if (data.manifest_id) {
-            setLastManifestId(data.manifest_id)
-          }
-        } else {
-          setScanStatus(data)
-          if (data.status === 'completed') {
-            fetchPersons()
+
+    const connectWebSocket = () => {
+      try {
+        ws = new WebSocket(wsUrl)
+        ws.onopen = () => {
+          console.log('WebSocket connected')
+        }
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data)
+          if (data.status === 'exporting' || data.status === 'export_completed') {
+            setExportStatus(data)
+            if (data.manifest_id) {
+              setLastManifestId(data.manifest_id)
+              fetchManifests() // Refresh manifests on completion
+            }
+          } else {
+            setScanStatus(data)
+            if (data.status === 'completed') {
+              fetchPersons()
+            }
           }
         }
+        ws.onclose = () => {
+          console.warn('WebSocket disconnected. Attempting to reconnect...')
+          reconnectTimer = setTimeout(connectWebSocket, 3000)
+        }
+        ws.onerror = (err) => {
+          console.error('WebSocket error:', err)
+          ws.close()
+        }
+      } catch (err) {
+        console.warn('WebSocket connection error:', err)
       }
-    } catch (err) {
-      console.warn('WebSocket connection error:', err)
     }
 
+    connectWebSocket()
+
     return () => {
-      if (ws) ws.close()
+      if (reconnectTimer) clearTimeout(reconnectTimer)
+      if (ws) {
+        ws.onclose = null // Prevent reconnect on unmount
+        ws.close()
+      }
     }
   }, [])
 
@@ -81,8 +104,18 @@ export default function App() {
     }
   }
 
+  const fetchManifests = async () => {
+    try {
+      const res = await axios.get('/api/organize/manifests')
+      setManifests(res.data)
+    } catch (err) {
+      console.error('Failed to fetch manifests:', err)
+    }
+  }
+
   useEffect(() => {
     fetchPersons()
+    fetchManifests()
   }, [])
 
   // Listen for unmerge events from PersonGallery child component
@@ -157,6 +190,7 @@ export default function App() {
       try {
         await axios.post('/api/workspace/reset')
         setPersons([])
+        setManifests([])
         setLastManifestId(null)
         setScanStatus({
           status: 'idle',
@@ -218,12 +252,14 @@ export default function App() {
     }
   }
 
-  const handleUndo = async () => {
-    if (!lastManifestId) return
+  const handleUndo = async (manifestId) => {
+    const targetManifestId = typeof manifestId === 'string' ? manifestId : lastManifestId;
+    if (!targetManifestId) return
     try {
-      const res = await axios.post('/api/organize/undo', { manifest_id: lastManifestId })
+      const res = await axios.post('/api/organize/undo', { manifest_id: targetManifestId })
       showNotification('success', `Undo complete! Restored ${res.data.restored_count} files.`)
-      setLastManifestId(null)
+      if (targetManifestId === lastManifestId) setLastManifestId(null)
+      fetchManifests()
     } catch (err) {
       showNotification('error', 'Failed to undo operation.')
     }
@@ -342,21 +378,32 @@ export default function App() {
             <div className="glazzed-glass rounded-2xl p-8 max-w-4xl mx-auto space-y-4">
               <h2 className="text-xl font-bold text-white">Sorting Audit Trail</h2>
               <p className="text-xs text-slate-400">All file moves, copies, and symlink operations are recorded in SQLite manifests for 1-click reversal.</p>
-              {lastManifestId ? (
-                <div className="p-4 rounded-xl bg-amber-950/40 border border-amber-500/40 flex items-center justify-between">
-                  <div>
-                    <p className="text-sm font-bold text-amber-300">Active Manifest ID: {lastManifestId}</p>
-                    <p className="text-xs text-slate-400">You can undo the last file sorting action anytime.</p>
-                  </div>
-                  <button
-                    onClick={handleUndo}
-                    className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs flex items-center gap-2"
-                  >
-                    <RotateCcw className="w-4 h-4" /> Undo Sorting
-                  </button>
+              
+              {manifests.length > 0 ? (
+                <div className="space-y-3 mt-6">
+                  {manifests.map((manifest) => (
+                    <div key={manifest.manifest_id} className="p-4 rounded-xl bg-slate-900/50 border border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                      <div>
+                        <p className="text-sm font-bold text-white mb-1">Manifest ID: <span className="text-cyan-400 font-mono text-xs">{manifest.manifest_id}</span></p>
+                        <div className="flex flex-wrap items-center gap-4 text-[11px] font-mono text-slate-400">
+                          <span>Target: <span className="text-slate-300">{manifest.target_dir}</span></span>
+                          <span className="w-1 h-1 rounded-full bg-slate-700"></span>
+                          <span>Mode: <span className="text-purple-400 uppercase font-bold">{manifest.operation_mode}</span></span>
+                          <span className="w-1 h-1 rounded-full bg-slate-700"></span>
+                          <span>Time: <span className="text-emerald-400">{new Date(manifest.created_at).toLocaleString()}</span></span>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handleUndo(manifest.manifest_id)}
+                        className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-amber-600 text-slate-300 hover:text-white font-bold text-xs flex items-center justify-center gap-2 transition-all border border-slate-700 hover:border-amber-500"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" /> Undo This Action
+                      </button>
+                    </div>
+                  ))}
                 </div>
               ) : (
-                <p className="text-xs text-slate-500 italic">No recent sorting session manifest pending.</p>
+                <p className="text-xs text-slate-500 italic mt-6 bg-slate-900/50 p-6 rounded-xl text-center border border-slate-800">No sorting manifests have been generated yet.</p>
               )}
             </div>
           )}

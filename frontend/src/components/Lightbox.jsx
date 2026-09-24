@@ -1,17 +1,34 @@
 import React, { useState, useEffect } from 'react'
 import axios from 'axios'
-import { X, Trash2, UserCheck, ShieldAlert, FileImage, Calendar, HardDrive } from 'lucide-react'
+import { X, Trash2, UserCheck, ShieldAlert, FileImage, Calendar, HardDrive, ChevronLeft, ChevronRight } from 'lucide-react'
 
-export default function Lightbox({ image, persons, onClose, onDeleteFace, onReassignFace }) {
+export default function Lightbox({ image, persons, onClose, onDeleteFace, onReassignFace, onNext, onPrev }) {
   const [faces, setFaces] = useState([])
   const [selectedFace, setSelectedFace] = useState(null)
   const [targetPersonId, setTargetPersonId] = useState('')
+  const [newPersonName, setNewPersonName] = useState('')
+  const [isCreatingNew, setIsCreatingNew] = useState(false)
+  const [isReassigning, setIsReassigning] = useState(false)
 
   useEffect(() => {
     if (image?.image_id) {
       fetchFaces(image.image_id)
+      setSelectedFace(null)
+      setTargetPersonId('')
+      setNewPersonName('')
+      setIsCreatingNew(false)
     }
   }, [image])
+
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') onClose()
+      if (e.key === 'ArrowRight' && onNext) onNext()
+      if (e.key === 'ArrowLeft' && onPrev) onPrev()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [onClose, onNext, onPrev])
 
   const fetchFaces = async (imageId) => {
     try {
@@ -29,11 +46,27 @@ export default function Lightbox({ image, persons, onClose, onDeleteFace, onReas
   }
 
   const handleReassign = async (faceId) => {
-    if (targetPersonId) {
-      await onReassignFace(faceId, targetPersonId)
+    setIsReassigning(true)
+    let finalTargetId = targetPersonId;
+    if (isCreatingNew && newPersonName.trim()) {
+      try {
+        const res = await axios.post('/api/persons/create', { display_name: newPersonName.trim() });
+        finalTargetId = res.data.person_id;
+      } catch (err) {
+        console.error('Failed to create person', err);
+        setIsReassigning(false)
+        return;
+      }
+    }
+    if (finalTargetId) {
+      await onReassignFace(faceId, finalTargetId)
       fetchFaces(image.image_id)
       setSelectedFace(null)
+      setTargetPersonId('')
+      setNewPersonName('')
+      setIsCreatingNew(false)
     }
+    setIsReassigning(false)
   }
 
   if (!image) return null
@@ -60,19 +93,45 @@ export default function Lightbox({ image, persons, onClose, onDeleteFace, onReas
         </div>
 
         {/* Lightbox Body */}
-        <div className="grid grid-cols-12 flex-1 overflow-hidden">
+        <div className="grid grid-cols-12 flex-1 overflow-hidden relative">
+          
           {/* Main Image Stage with SVG Bounding Box Overlays */}
-          <div className="col-span-8 bg-black/80 p-4 flex items-center justify-center relative overflow-hidden">
-            <div className="relative max-h-full max-w-full inline-block">
+          <div className="col-span-8 bg-black/80 p-4 flex items-center justify-center relative overflow-hidden group">
+            {onPrev && (
+              <button 
+                onClick={onPrev}
+                className="absolute left-4 z-30 p-2 rounded-full bg-black/50 text-white hover:bg-cyan-600 transition-all opacity-0 group-hover:opacity-100"
+              >
+                <ChevronLeft className="w-6 h-6" />
+              </button>
+            )}
+            
+            {onNext && (
+              <button 
+                onClick={onNext}
+                className="absolute right-4 z-30 p-2 rounded-full bg-black/50 text-white hover:bg-cyan-600 transition-all opacity-0 group-hover:opacity-100"
+              >
+                <ChevronRight className="w-6 h-6" />
+              </button>
+            )}
+
+            {/* Wrapper div matches exactly the dimensions of the rendered image based on aspect ratio */}
+            <div 
+              className="relative inline-block"
+              style={{
+                maxWidth: '100%',
+                maxHeight: '100%',
+                aspectRatio: `${image.width} / ${image.height}`
+              }}
+            >
               <img
                 src={`/api/image?path=${encodeURIComponent(image.file_path)}`}
                 alt={image.file_name}
-                className="max-h-[70vh] max-w-full object-contain rounded"
+                className="w-full h-full object-cover rounded"
               />
 
               {/* Face Bounding Box SVG Overlays */}
               {faces.map((f) => {
-                // Calculate percentage coordinates
                 const left = (f.bbox_x / image.width) * 100
                 const top = (f.bbox_y / image.height) * 100
                 const width = (f.bbox_w / image.width) * 100
@@ -95,7 +154,7 @@ export default function Lightbox({ image, persons, onClose, onDeleteFace, onReas
                         : 'border-emerald-400/80 hover:border-cyan-400 hover:bg-cyan-400/10 z-10'
                     }`}
                   >
-                    <span className="absolute -top-5 left-0 bg-slate-900/90 border border-emerald-500/50 text-emerald-300 font-mono text-[9px] font-bold px-1.5 py-0.5 rounded shadow">
+                    <span className="absolute -top-5 left-0 bg-slate-900/90 border border-emerald-500/50 text-emerald-300 font-mono text-[9px] font-bold px-1.5 py-0.5 rounded shadow whitespace-nowrap">
                       {f.person_id || 'Face'} ({(f.confidence * 100).toFixed(0)}%)
                     </span>
                   </div>
@@ -155,23 +214,44 @@ export default function Lightbox({ image, persons, onClose, onDeleteFace, onReas
                 <div className="space-y-2">
                   <label className="block text-[11px] font-semibold text-slate-300">Reassign to Person Profile</label>
                   <select
-                    value={targetPersonId}
-                    onChange={(e) => setTargetPersonId(e.target.value)}
+                    value={isCreatingNew ? 'CREATE_NEW' : targetPersonId}
+                    onChange={(e) => {
+                      if (e.target.value === 'CREATE_NEW') {
+                        setIsCreatingNew(true);
+                        setTargetPersonId('');
+                      } else {
+                        setIsCreatingNew(false);
+                        setTargetPersonId(e.target.value);
+                      }
+                    }}
                     className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
                   >
                     <option value="">Select target person...</option>
+                    <option value="CREATE_NEW" className="font-bold text-cyan-400">✨ Create New Person Profile...</option>
                     {persons.map((p) => (
                       <option key={p.person_id} value={p.person_id}>
                         {p.display_name} ({p.person_id})
                       </option>
                     ))}
                   </select>
+
+                  {isCreatingNew && (
+                    <input
+                      type="text"
+                      placeholder="Enter new person name..."
+                      value={newPersonName}
+                      onChange={(e) => setNewPersonName(e.target.value)}
+                      className="w-full bg-slate-900 border border-cyan-500 rounded-lg px-3 py-2 text-xs text-white focus:outline-none mt-2"
+                      autoFocus
+                    />
+                  )}
+
                   <button
                     onClick={() => handleReassign(selectedFace.face_id)}
-                    disabled={!targetPersonId}
+                    disabled={isReassigning || (!targetPersonId && !isCreatingNew) || (isCreatingNew && !newPersonName.trim())}
                     className="w-full bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white font-bold text-xs py-2 rounded-lg transition-all"
                   >
-                    Reassign Face Profile
+                    {isReassigning ? 'Reassigning...' : 'Reassign Face Profile'}
                   </button>
                 </div>
 

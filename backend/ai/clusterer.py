@@ -1,126 +1,152 @@
 import numpy as np
 from sklearn.cluster import AgglomerativeClustering
-from typing import List, Optional
-from backend.config import DEFAULT_COSINE_THRESHOLD
+from collections import Counter
+from backend.config import (
+    DEFAULT_COSINE_THRESHOLD, TIGHT_CLUSTER_THRESHOLD,
+    MAX_CENTROID_MERGE_THRESHOLD, MIN_PAIRWISE_SAFETY_THRESHOLD
+)
 
+class UnionFind:
+    def __init__(self, n):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, i):
+        if self.parent[i] == i:
+            return i
+        self.parent[i] = self.find(self.parent[i])
+        return self.parent[i]
+
+    def union(self, i, j):
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            if self.rank[root_i] < self.rank[root_j]:
+                self.parent[root_i] = root_j
+            elif self.rank[root_i] > self.rank[root_j]:
+                self.parent[root_j] = root_i
+            else:
+                self.parent[root_j] = root_i
+                self.rank[root_i] += 1
 
 class FaceClusterer:
     """
-    Two-Stage Safe Cosine Distance Clustering Engine for Face Embeddings.
-
-    Stage 1: Agglomerative Clustering using 'average' linkage (mean pairwise distance).
-    Stage 2: Safe Centroid Merger — merges candidate clusters only when centroid distance
-             is strictly within identity limits (≤ 0.50), preventing over-merging & domino collapses.
-
-    Clamps distance thresholds to safe bounds for SFace 512D embeddings (0.35 to 0.52).
+    Adaptive Multi-Pass Face Clustering.
+    Pass 1: Tight Micro-Clusters using average linkage Agglomerative Clustering.
+    Pass 2: Adaptive Centroid Merge using Union-Find and a minimum pairwise safety check.
     """
-
-    def __init__(self, distance_threshold: float = DEFAULT_COSINE_THRESHOLD):
+    def __init__(self, distance_threshold=DEFAULT_COSINE_THRESHOLD):
         self.distance_threshold = distance_threshold
 
-    def cluster(self, embeddings: List[np.ndarray], distance_threshold: Optional[float] = None) -> List[int]:
+    def cluster(self, embeddings_list, distance_threshold=None):
         """
-        Cluster a list of 512D normalized embedding vectors.
-
-        Safe Threshold limits:
-          0.38 = Strict (near-identical faces only)
-          0.45 = Balanced frontal (default for events)
-          0.48 = Pose-tolerant (handles 3/4 angles & pose variations)
-          0.52 = Maximum multi-angle threshold (prevents merging distinct identities)
+        Clusters a list of embeddings.
+        Returns a list of cluster labels of the same length as the input list.
+        Invalid embeddings or those with incorrect dimensions are labeled as -1.
         """
-        if not embeddings:
+        if not embeddings_list:
             return []
+            
+        threshold = distance_threshold if distance_threshold is not None else self.distance_threshold
+            
+        # Filter valid embeddings
+        valid_embs = []
+        valid_indices = []
+        for i, emb in enumerate(embeddings_list):
+            if isinstance(emb, np.ndarray) and emb.size > 0:
+                valid_embs.append(emb.flatten())
+                valid_indices.append(i)
+                
+        if not valid_embs:
+            return [-1] * len(embeddings_list)
+            
+        if len(valid_embs) == 1:
+            res = [-1] * len(embeddings_list)
+            res[valid_indices[0]] = 0
+            return res
+            
+        # Ensure same dimension
+        dims = [emb.shape[0] for emb in valid_embs]
+        most_common_dim = Counter(dims).most_common(1)[0][0]
+        
+        filtered_embs = []
+        idx_map = []
+        for orig_idx, emb in zip(valid_indices, valid_embs):
+            if emb.shape[0] == most_common_dim:
+                filtered_embs.append(emb)
+                idx_map.append(orig_idx)
+        
+        if not filtered_embs:
+            return [-1] * len(embeddings_list)
+            
+        if len(filtered_embs) == 1:
+            res = [-1] * len(embeddings_list)
+            res[idx_map[0]] = 0
+            return res
 
-        # Filter out invalid or non-numpy embedding arrays
-        valid_embeddings = [emb.flatten().astype(np.float32) for emb in embeddings if isinstance(emb, np.ndarray) and emb.size > 0]
-        if not valid_embeddings:
-            return []
-
-        # Find target feature dimension (most common dimension, e.g. 512D)
-        shapes = [emb.shape[0] for emb in valid_embeddings]
-        target_dim = max(set(shapes), key=shapes.count)
-
-        # Keep only embeddings matching the primary target dimension
-        filtered_embeddings = [emb for emb in valid_embeddings if emb.shape[0] == target_dim]
-
-        if not filtered_embeddings:
-            return []
-
-        if len(filtered_embeddings) == 1:
-            return [0]
-
-        raw_thresh = distance_threshold if distance_threshold is not None else self.distance_threshold
-        # HARD CAP: Clamp threshold to safe bounds for SFace 512D (0.35 to 0.52).
-        # Anything above 0.52 causes distinct people to merge together.
-        thresh = float(np.clip(raw_thresh, 0.35, 0.52))
-
-        X = np.vstack(filtered_embeddings).astype(np.float32)
-
-        # L2 normalize all embeddings (ensure unit vectors for cosine math)
+        X = np.array(filtered_embs)
+        
+        # L2 normalize
         norms = np.linalg.norm(X, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        X = X / norms
-
-        # Cosine Distance Matrix: D[i,j] = 1 - dot(X[i], X[j])
-        similarity_matrix = np.clip(np.dot(X, X.T), -1.0, 1.0)
-        distance_matrix = np.clip(1.0 - similarity_matrix, 0.0, 2.0)
-
-        # STAGE 1: Agglomerative Clustering with 'average' linkage
-        clustering_model = AgglomerativeClustering(
+        norms[norms == 0] = 1
+        X_norm = X / norms
+        
+        # Cosine distance matrix
+        D = 1.0 - np.dot(X_norm, X_norm.T)
+        D = np.clip(D, 0.0, 2.0)
+        
+        # Pass 1: Tight Micro-Clusters
+        agg_cluster = AgglomerativeClustering(
             n_clusters=None,
             metric='precomputed',
             linkage='average',
-            distance_threshold=thresh
+            distance_threshold=TIGHT_CLUSTER_THRESHOLD
         )
-
-        initial_labels = clustering_model.fit_predict(distance_matrix).tolist()
-
-        # STAGE 2: Post-Processing Centroid Merge Pass
-        # Compute normalized 512D centroid vector for each candidate cluster
-        cluster_vectors = {}
-        for idx, lbl in enumerate(initial_labels):
-            cluster_vectors.setdefault(lbl, []).append(X[idx])
-
-        centroids = {}
-        for lbl, vecs in cluster_vectors.items():
-            c_mean = np.mean(vecs, axis=0)
-            c_norm = np.linalg.norm(c_mean)
-            centroids[lbl] = c_mean / c_norm if c_norm > 0 else c_mean
-
-        # Safe centroid merger limit: max 0.50 distance
-        safe_centroid_thresh = min(0.50, thresh * 1.02)
-
-        parent = {lbl: lbl for lbl in centroids.keys()}
-
-        def find(i):
-            if parent[i] == i:
-                return i
-            parent[i] = find(parent[i])
-            return parent[i]
-
-        def union(i, j):
-            root_i = find(i)
-            root_j = find(j)
-            if root_i != root_j:
-                parent[root_j] = root_i
-
-        lbl_keys = list(centroids.keys())
-        for i in range(len(lbl_keys)):
-            k1 = lbl_keys[i]
-            for j in range(i + 1, len(lbl_keys)):
-                k2 = lbl_keys[j]
-                if find(k1) != find(k2):
-                    # Cosine distance between cluster centroids
-                    sim = float(np.clip(np.dot(centroids[k1], centroids[k2]), -1.0, 1.0))
-                    c_dist = 1.0 - sim
-                    if c_dist <= safe_centroid_thresh:
-                        union(k1, k2)
-
-        # Map final cluster labels
-        final_raw_labels = [find(lbl) for lbl in initial_labels]
-
-        # Compact label indices (0, 1, 2, ...)
-        unique_labels = {lbl: idx for idx, lbl in enumerate(sorted(set(final_raw_labels)))}
-        compacted = [unique_labels[lbl] for lbl in final_raw_labels]
-
-        return compacted
+        micro_labels = agg_cluster.fit_predict(D)
+        
+        # Pass 2: Adaptive Centroid Merge
+        num_micro = len(set(micro_labels))
+        micro_indices = {i: [] for i in range(num_micro)}
+        for idx, label in enumerate(micro_labels):
+            micro_indices[label].append(idx)
+            
+        centroids = []
+        for i in range(num_micro):
+            cluster_embs = X_norm[micro_indices[i]]
+            c = np.mean(cluster_embs, axis=0)
+            c_norm = np.linalg.norm(c)
+            if c_norm > 0:
+                c = c / c_norm
+            centroids.append(c)
+        centroids = np.array(centroids)
+        
+        centroid_thresh = min(threshold, MAX_CENTROID_MERGE_THRESHOLD)
+        
+        uf = UnionFind(num_micro)
+        for i in range(num_micro):
+            for j in range(i + 1, num_micro):
+                dist = 1.0 - np.dot(centroids[i], centroids[j])
+                dist = max(0.0, min(dist, 2.0))
+                
+                if dist <= centroid_thresh:
+                    # Safety check: min pairwise distance between cluster members
+                    sub_D = D[np.ix_(micro_indices[i], micro_indices[j])]
+                    min_pairwise = np.min(sub_D)
+                    if min_pairwise <= MIN_PAIRWISE_SAFETY_THRESHOLD:
+                        uf.union(i, j)
+                        
+        final_labels = [uf.find(i) for i in range(num_micro)]
+        
+        # Compact labels
+        unique_labels = list(set(final_labels))
+        unique_labels.sort()
+        label_map = {old: new for new, old in enumerate(unique_labels)}
+        
+        compact_labels = [label_map[final_labels[micro_labels[i]]] for i in range(len(X_norm))]
+        
+        # Map back to original indices
+        result = [-1] * len(embeddings_list)
+        for filtered_idx, orig_idx in enumerate(idx_map):
+            result[orig_idx] = compact_labels[filtered_idx]
+            
+        return result

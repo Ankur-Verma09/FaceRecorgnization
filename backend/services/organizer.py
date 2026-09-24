@@ -95,7 +95,7 @@ class PhotoOrganizerService:
 
                 # Case A1: Both Person 1 and Person 2 are present in the photo
                 if couple_set.issubset(active_set) or couple_set.issubset(all_set):
-                    if len(all_set) == 2:
+                    if len(active_set) == 2:
                         dest_folder = couple_root / "Couple_Photos"
                     else:
                         dest_folder = couple_root / "Couple_With_Guests"
@@ -106,7 +106,7 @@ class PhotoOrganizerService:
                     p_name = all_persons.get(p_id, p_id)
                     safe_p_name = "".join([c for c in p_name if c.isalnum() or c in (' ', '_', '-')]).strip()
 
-                    if len(all_set) == 1:
+                    if len(active_set) == 1:
                         dest_folder = couple_root / f"Solo_{safe_p_name}"
                     else:
                         dest_folder = couple_root / f"Solo_{safe_p_name}_With_Guests"
@@ -160,8 +160,16 @@ class PhotoOrganizerService:
             try:
                 if operation_mode == "move":
                     shutil.move(str(src_path), str(dest_file_path))
+                    conn = self.db.get_connection()
+                    with conn:
+                        conn.execute("UPDATE images SET file_path = ? WHERE image_id = ?", (str(dest_file_path), img_id))
+                    conn.close()
                 elif operation_mode == "symlink":
-                    os.symlink(str(src_path), str(dest_file_path))
+                    try:
+                        os.symlink(str(src_path), str(dest_file_path))
+                    except OSError as e:
+                        print(f"Symlink failed for {src_path}: {e}. Falling back to copy2.")
+                        shutil.copy2(str(src_path), str(dest_file_path))
                 else: # "copy" default
                     shutil.copy2(str(src_path), str(dest_file_path))
 

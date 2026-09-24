@@ -6,9 +6,12 @@ from typing import List, Dict, Any, Optional
 from backend.config import DB_PATH
 
 def get_connection():
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA cache_size=-64000;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
@@ -50,6 +53,7 @@ def init_db():
             is_primary INTEGER DEFAULT 1,
             area_ratio REAL DEFAULT 0.01,
             sharpness REAL DEFAULT 100.0,
+            cluster_eligible INTEGER DEFAULT 1,
             FOREIGN KEY (image_id) REFERENCES images(image_id),
             FOREIGN KEY (person_id) REFERENCES persons(person_id)
         );
@@ -102,6 +106,8 @@ def init_db():
             cursor.execute("ALTER TABLE faces ADD COLUMN area_ratio REAL DEFAULT 0.01;")
         if 'sharpness' not in face_cols:
             cursor.execute("ALTER TABLE faces ADD COLUMN sharpness REAL DEFAULT 100.0;")
+        if 'cluster_eligible' not in face_cols:
+            cursor.execute("ALTER TABLE faces ADD COLUMN cluster_eligible INTEGER DEFAULT 1;")
 
         # Ensure merge_groups table exists (for older DBs)
         cursor.execute("PRAGMA table_info(merge_groups);")
@@ -118,6 +124,17 @@ def init_db():
                     merged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_faces_person_id ON faces(person_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_faces_image_id ON faces(image_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_faces_cluster_eligible ON faces(cluster_eligible);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_images_dimensions ON images(file_size, width, height);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_scanned_at ON scan_sessions(scanned_at DESC);")
+        
+        cursor.execute("PRAGMA table_info(sort_manifests);")
+        sm_cols = [row[1] for row in cursor.fetchall()]
+        if 'is_undone' not in sm_cols:
+            cursor.execute("ALTER TABLE sort_manifests ADD COLUMN is_undone INTEGER DEFAULT 0;")
 
     conn.close()
 
@@ -152,13 +169,13 @@ class DatabaseManager:
             for f in faces_data:
                 emb_blob = f['embedding'].tobytes() if isinstance(f['embedding'], np.ndarray) else f['embedding']
                 conn.execute("""
-                    INSERT OR REPLACE INTO faces (face_id, image_id, bbox_x, bbox_y, bbox_w, bbox_h, confidence, embedding, person_id, thumbnail_path, is_primary, area_ratio, sharpness)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO faces (face_id, image_id, bbox_x, bbox_y, bbox_w, bbox_h, confidence, embedding, person_id, thumbnail_path, is_primary, area_ratio, sharpness, cluster_eligible)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     f['face_id'], f['image_id'], f['bbox_x'], f['bbox_y'], f['bbox_w'], f['bbox_h'],
                     f['confidence'], emb_blob, f.get('person_id'), f.get('thumbnail_path'),
                     1 if f.get('is_primary', True) else 0, f.get('area_ratio', 0.01),
-                    f.get('sharpness', 100.0)
+                    f.get('sharpness', 100.0), f.get('cluster_eligible', 1)
                 ))
         conn.close()
 
@@ -236,6 +253,18 @@ class DatabaseManager:
             conn.execute("UPDATE faces SET person_id = NULL WHERE person_id = ?", (person_id,))
             conn.execute("DELETE FROM persons WHERE person_id = ?", (person_id,))
         conn.close()
+
+    def get_images_for_person(self, person_id: str) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.execute("""
+            SELECT DISTINCT i.*
+            FROM images i
+            JOIN faces f ON i.image_id = f.image_id
+            WHERE f.person_id = ?
+        """, (person_id,))
+        images = [dict(row) for row in cur.fetchall()]
+        conn.close()
+        return images
 
     def merge_persons(self, source_person_id: str, target_person_id: str) -> str:
         """Merge source person into target, recording full history for unmerge."""
@@ -326,11 +355,13 @@ class DatabaseManager:
 
                 # Reassign faces back to restored person
                 if face_ids:
-                    placeholders = ','.join('?' * len(face_ids))
-                    conn.execute(
-                        f"UPDATE faces SET person_id = ? WHERE face_id IN ({placeholders})",
-                        [source_person_id] + face_ids
-                    )
+                    for i in range(0, len(face_ids), 500):
+                        chunk = face_ids[i:i+500]
+                        placeholders = ','.join('?' * len(chunk))
+                        conn.execute(
+                            f"UPDATE faces SET person_id = ? WHERE face_id IN ({placeholders})",
+                            [source_person_id] + chunk
+                        )
 
                 # Update target person face count
                 cur2 = conn.execute("SELECT COUNT(*) FROM faces WHERE person_id = ?", (target_person_id,))
@@ -369,7 +400,7 @@ class DatabaseManager:
         conn = get_connection()
         cur = conn.execute("""
             SELECT f.face_id, f.image_id, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h, f.confidence,
-                   f.person_id, f.thumbnail_path, f.embedding, f.is_primary, f.area_ratio, f.sharpness,
+                   f.person_id, f.thumbnail_path, f.embedding, f.is_primary, f.area_ratio, f.sharpness, f.cluster_eligible,
                    i.file_path, i.file_name, i.width, i.height, i.datetime_taken, i.face_count, i.sharpness as img_sharpness
             FROM faces f
             JOIN images i ON f.image_id = i.image_id
@@ -496,3 +527,10 @@ class DatabaseManager:
                 "yearly": yearly_data
             }
         }
+
+    def get_all_manifests(self) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.execute("SELECT * FROM sort_manifests ORDER BY created_at DESC")
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows

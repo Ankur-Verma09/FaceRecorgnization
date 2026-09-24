@@ -57,11 +57,14 @@ export default function OverviewDashboard({
   })
 
   const [activeTimeRange, setActiveTimeRange] = useState('7d') // 'all', '7d', '15d', 'monthly', 'yearly'
+  const [mediaLimit, setMediaLimit] = useState(15)
 
   useEffect(() => {
-    fetchImages()
-    fetchInsights()
-  }, [scannedCount, scanStatus.status])
+    if (scanStatus.status === 'completed' || scanStatus.status === 'idle') {
+      fetchImages()
+      fetchInsights()
+    }
+  }, [scanStatus.status])
 
   const fetchImages = async () => {
     try {
@@ -322,7 +325,7 @@ export default function OverviewDashboard({
               {isCompleted && (
                 <button
                   type="button"
-                  onClick={() => onExecuteOrganize({ library_name: libraryName })}
+                  onClick={() => onExecuteOrganize({ library_name: libraryName, target_dir: targetDir })}
                   className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-5 py-2.5 rounded-xl shadow-lg shadow-emerald-600/30 flex items-center gap-2 transition-all"
                 >
                   <CheckCircle2 className="w-4 h-4" /> Export to "{libraryName || 'Event_Library'}" Now
@@ -620,45 +623,57 @@ export default function OverviewDashboard({
               No photo records in local database. Run a folder scan to populate images.
             </div>
           ) : (
-            <div className="overflow-x-auto max-h-80 overflow-y-auto">
-              <table className="w-full text-left text-xs text-slate-300">
-                <thead className="bg-slate-900/80 text-slate-400 uppercase text-[10px] font-mono sticky top-0">
-                  <tr>
-                    <th className="p-2.5">File Name</th>
-                    <th className="p-2.5">Faces</th>
-                    <th className="p-2.5">Size</th>
-                    <th className="p-2.5">Action</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800/40 font-mono text-[11px]">
-                  {filteredImages.slice(0, 15).map((img) => (
-                    <tr
-                      key={img.image_id}
-                      onClick={() => onSelectImageForLightbox(img)}
-                      className="hover:bg-cyan-950/40 cursor-pointer transition-colors group"
-                    >
-                      <td className="p-2.5 font-bold text-white max-w-[180px] truncate group-hover:text-cyan-400" title={img.file_name}>
-                        {img.file_name}
-                      </td>
-                      <td className="p-2.5">
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                          img.face_count > 0 ? 'bg-cyan-500/20 text-cyan-300' : 'bg-slate-800 text-slate-400'
-                        }`}>
-                          {img.face_count} faces
-                        </span>
-                      </td>
-                      <td className="p-2.5 text-slate-400">
-                        {(img.file_size / (1024 * 1024)).toFixed(2)} MB
-                      </td>
-                      <td className="p-2.5">
-                        <button className="text-slate-400 group-hover:text-cyan-400 flex items-center gap-1 font-semibold text-[10px]">
-                          <Maximize2 className="w-3 h-3" /> Lightbox
-                        </button>
-                      </td>
+            <div className="flex flex-col max-h-[22rem]">
+              <div className="overflow-x-auto overflow-y-auto flex-1">
+                <table className="w-full text-left text-xs text-slate-300">
+                  <thead className="bg-slate-900/80 text-slate-400 uppercase text-[10px] font-mono sticky top-0">
+                    <tr>
+                      <th className="p-2.5">File Name</th>
+                      <th className="p-2.5">Faces</th>
+                      <th className="p-2.5">Size</th>
+                      <th className="p-2.5">Action</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/40 font-mono text-[11px]">
+                    {filteredImages.slice(0, mediaLimit).map((img) => (
+                      <tr
+                        key={img.image_id}
+                        onClick={() => onSelectImageForLightbox(img)}
+                        className="hover:bg-cyan-950/40 cursor-pointer transition-colors group"
+                      >
+                        <td className="p-2.5 font-bold text-white max-w-[180px] truncate group-hover:text-cyan-400" title={img.file_name}>
+                          {img.file_name}
+                        </td>
+                        <td className="p-2.5">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            img.face_count > 0 ? 'bg-cyan-500/20 text-cyan-300' : 'bg-slate-800 text-slate-400'
+                          }`}>
+                            {img.face_count} faces
+                          </span>
+                        </td>
+                        <td className="p-2.5 text-slate-400">
+                          {(img.file_size / (1024 * 1024)).toFixed(2)} MB
+                        </td>
+                        <td className="p-2.5">
+                          <button className="text-slate-400 group-hover:text-cyan-400 flex items-center gap-1 font-semibold text-[10px]">
+                            <Maximize2 className="w-3 h-3" /> Lightbox
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              
+              {/* Pagination / Load More Controls */}
+              {filteredImages.length > mediaLimit && (
+                <div className="mt-4 flex justify-center gap-2 pb-2">
+                  <button onClick={() => setMediaLimit(15)} className={`px-3 py-1 rounded text-xs ${mediaLimit === 15 ? 'bg-cyan-600 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}`}>15</button>
+                  <button onClick={() => setMediaLimit(30)} className={`px-3 py-1 rounded text-xs ${mediaLimit === 30 ? 'bg-cyan-600 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}`}>30</button>
+                  <button onClick={() => setMediaLimit(50)} className={`px-3 py-1 rounded text-xs ${mediaLimit === 50 ? 'bg-cyan-600 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}`}>50</button>
+                  <button onClick={() => setMediaLimit(mediaLimit + 15)} className="px-3 py-1 rounded bg-slate-800 text-slate-300 hover:bg-slate-700 text-xs">Load More...</button>
+                </div>
+              )}
             </div>
           )}
         </div>

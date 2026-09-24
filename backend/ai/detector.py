@@ -2,7 +2,26 @@ import cv2
 import numpy as np
 from PIL import Image
 from typing import List, Dict, Any, Optional, Tuple
-from backend.config import YUNET_MODEL_PATH, PRIMARY_FACE_AREA_THRESHOLD, BLUR_SHARPNESS_THRESHOLD
+from backend.config import (
+    YUNET_MODEL_PATH, PRIMARY_FACE_AREA_THRESHOLD, BLUR_SHARPNESS_THRESHOLD,
+    DETECTION_SCALES, DETECTION_SCALES_LARGE, DETECTION_IOU_DEDUP_THRESHOLD
+)
+
+def compute_iou(boxA: List[float], boxB: List[float]) -> float:
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+    yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+
+    interArea = max(0.0, xB - xA) * max(0.0, yB - yA)
+    if interArea == 0:
+        return 0.0
+
+    boxAArea = boxA[2] * boxA[3]
+    boxBArea = boxB[2] * boxB[3]
+    
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+    return iou
 
 def read_image_unicode(file_path: str) -> Optional[np.ndarray]:
     """
@@ -10,22 +29,11 @@ def read_image_unicode(file_path: str) -> Optional[np.ndarray]:
     and professional camera RAW files (via PIL/rawpy fallback).
     """
     try:
-        # Try standard OpenCV imdecode with binary stream first
-        with open(file_path, "rb") as f:
-            bytes_data = bytearray(f.read())
-            numpy_array = np.asarray(bytes_data, dtype=np.uint8)
-            img = cv2.imdecode(numpy_array, cv2.IMREAD_COLOR)
-            if img is not None:
-                return img
-    except Exception:
-        pass
-
-    # Fallback to PIL Image for RAW/HEIC/TIF formats
-    try:
+        from PIL import Image, ImageOps
         pil_img = Image.open(file_path)
+        pil_img = ImageOps.exif_transpose(pil_img)
         pil_img = pil_img.convert("RGB")
         img_np = np.array(pil_img)
-        # Convert RGB to BGR for OpenCV
         return cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     except Exception as e:
         print(f"Error reading image file {file_path}: {e}")
@@ -93,8 +101,16 @@ class FaceDetectorEngine:
         r_mouth_y = landmarks[3][1]
         l_mouth_y = landmarks[4][1]
 
-        # Eyes must be positioned above mouth corners
-        if r_eye_y >= r_mouth_y or l_eye_y >= l_mouth_y:
+        eye_center_y = (r_eye_y + l_eye_y) / 2.0
+        mouth_center_y = (r_mouth_y + l_mouth_y) / 2.0
+
+        if eye_center_y >= mouth_center_y + (h * 0.25):
+            return False
+
+        import math
+        eye_dist = math.sqrt((landmarks[0][0] - landmarks[1][0])**2 + (landmarks[0][1] - landmarks[1][1])**2)
+        bbox_diag = math.sqrt(w**2 + h**2)
+        if eye_dist < 0.12 * bbox_diag:
             return False
 
         # Confidence check
@@ -112,58 +128,79 @@ class FaceDetectorEngine:
 
         h, w, _ = image_bgr.shape
         img_area = float(w * h)
+        max_dim = max(h, w)
         
-        # Resize large images to max dimension 1280 while preserving aspect ratio
-        max_dim = 1280
-        scale = 1.0
-        if max(h, w) > max_dim:
-            scale = max_dim / float(max(h, w))
+        scales_to_run = list(DETECTION_SCALES)
+        if max_dim > 4000:
+            scales_to_run.append(DETECTION_SCALES_LARGE)
+
+        all_detections = []
+
+        # If the image is smaller than all configured scales, run at native resolution
+        runnable_scales = [s for s in scales_to_run if max_dim >= s]
+        if not runnable_scales:
+            runnable_scales = [max_dim]
+
+        for scale_dim in runnable_scales:
+            scale = scale_dim / float(max_dim)
             target_w, target_h = int(w * scale), int(h * scale)
+            if target_w < 10 or target_h < 10:
+                continue
             resized = cv2.resize(image_bgr, (target_w, target_h))
-        else:
-            resized = image_bgr
-            target_w, target_h = w, h
 
-        self.detector.setInputSize((target_w, target_h))
-        _, faces = self.detector.detect(resized)
+            self.detector.setInputSize((target_w, target_h))
+            _, faces = self.detector.detect(resized)
 
-        results = []
-        if faces is not None:
-            for face in faces:
-                bbox = [
-                    int(face[0] / scale),
-                    int(face[1] / scale),
-                    int(face[2] / scale),
-                    int(face[3] / scale)
-                ]
-                landmarks = [
-                    (float(face[4] / scale), float(face[5] / scale)),   # Right Eye
-                    (float(face[6] / scale), float(face[7] / scale)),   # Left Eye
-                    (float(face[8] / scale), float(face[9] / scale)),   # Nose Tip
-                    (float(face[10] / scale), float(face[11] / scale)), # Right Mouth Corner
-                    (float(face[12] / scale), float(face[13] / scale))  # Left Mouth Corner
-                ]
-                confidence = float(face[14])
+            if faces is not None:
+                max_face_area = max(float((f[2] / scale) * (f[3] / scale)) for f in faces) if len(faces) > 0 else 0.0
+                for face in faces:
+                    confidence = float(face[14])
+                    
+                    bbox = [
+                        int(face[0] / scale),
+                        int(face[1] / scale),
+                        int(face[2] / scale),
+                        int(face[3] / scale)
+                    ]
+                    landmarks = [
+                        (float(face[4] / scale), float(face[5] / scale)),
+                        (float(face[6] / scale), float(face[7] / scale)),
+                        (float(face[8] / scale), float(face[9] / scale)),
+                        (float(face[10] / scale), float(face[11] / scale)),
+                        (float(face[12] / scale), float(face[13] / scale))
+                    ]
 
-                # Filter non-face false positives
-                if not self.is_valid_face_candidate(bbox, landmarks, confidence):
-                    continue
+                    if not self.is_valid_face_candidate(bbox, landmarks, confidence):
+                        continue
 
-                # Face Area Ratio
-                face_area = float(bbox[2] * bbox[3])
-                area_ratio = face_area / img_area if img_area > 0 else 0.0
-                is_primary = area_ratio >= PRIMARY_FACE_AREA_THRESHOLD
+                    raw_unscaled = face.copy()
+                    raw_unscaled[0:14] = raw_unscaled[0:14] / scale
 
-                raw_unscaled = face.copy()
-                raw_unscaled[0:14] = raw_unscaled[0:14] / scale
+                    face_area = float(bbox[2] * bbox[3])
+                    area_ratio = face_area / img_area if img_area > 0 else 0.0
+                    is_primary = area_ratio >= PRIMARY_FACE_AREA_THRESHOLD or face_area >= 0.35 * max_face_area
 
-                results.append({
-                    'bbox': bbox,
-                    'confidence': confidence,
-                    'landmarks': landmarks,
-                    'area_ratio': area_ratio,
-                    'is_primary': is_primary,
-                    'raw': raw_unscaled
-                })
+                    all_detections.append({
+                        'bbox': bbox,
+                        'confidence': confidence,
+                        'landmarks': landmarks,
+                        'area_ratio': area_ratio,
+                        'is_primary': is_primary,
+                        'raw': raw_unscaled
+                    })
 
-        return results
+        # Deduplicate
+        deduped = []
+        for det in all_detections:
+            matched = False
+            for i, exist_det in enumerate(deduped):
+                iou = compute_iou(det['bbox'], exist_det['bbox'])
+                if iou > DETECTION_IOU_DEDUP_THRESHOLD:
+                    matched = True
+                    if det['confidence'] > exist_det['confidence']:
+                        deduped[i] = det
+                    break
+            if not matched:
+                deduped.append(det)
+
+        return deduped

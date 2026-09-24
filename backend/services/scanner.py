@@ -5,7 +5,10 @@ import numpy as np
 from PIL import Image, ExifTags
 from pathlib import Path
 from typing import List, Dict, Any, Callable, Optional
-from backend.config import SUPPORTED_EXTENSIONS, THUMBNAILS_DIR, DEFAULT_COSINE_THRESHOLD
+from backend.config import (
+    SUPPORTED_EXTENSIONS, THUMBNAILS_DIR, DEFAULT_COSINE_THRESHOLD,
+    MIN_FACE_SIZE_FOR_EMBEDDING, MIN_CONFIDENCE_FOR_CLUSTERING, MIN_SHARPNESS_FOR_CLUSTERING
+)
 from backend.ai.detector import FaceDetectorEngine, read_image_unicode, write_image_unicode, calculate_sharpness
 from backend.ai.embedder import FaceEmbedderEngine
 from backend.ai.clusterer import FaceClusterer
@@ -53,6 +56,30 @@ class PhotoScannerService:
             pass
         return None
 
+    def _determine_cluster_eligibility(self, face_rec: Dict[str, Any]) -> bool:
+        """
+        Phase 1: Quality Gate — determine if a face embedding is clean enough
+        to participate in automated clustering. Low-quality faces are still saved
+        to the DB (for display/manual assignment) but excluded from clustering.
+        """
+        # Check bounding box size in original image pixels
+        bbox_w = face_rec.get('bbox_w', 0)
+        bbox_h = face_rec.get('bbox_h', 0)
+        if bbox_w < MIN_FACE_SIZE_FOR_EMBEDDING or bbox_h < MIN_FACE_SIZE_FOR_EMBEDDING:
+            return False
+
+        # Check detection confidence
+        confidence = face_rec.get('confidence', 0.0)
+        if confidence < MIN_CONFIDENCE_FOR_CLUSTERING:
+            return False
+
+        # Check face crop sharpness
+        sharpness = face_rec.get('sharpness', 0.0)
+        if sharpness < MIN_SHARPNESS_FOR_CLUSTERING:
+            return False
+
+        return True
+
     def scan_directory(self, source_dir: str, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         self.reset_cancel()
         self.db.clear_cache()
@@ -98,7 +125,14 @@ class PhotoScannerService:
                 h, w, _ = image_bgr.shape
                 file_size = file_path.stat().st_size
                 dt_taken = self.extract_datetime_taken(file_path)
-                sharpness = calculate_sharpness(image_bgr)
+                
+                max_dim = max(h, w)
+                if max_dim > 1024:
+                    scale_proxy = 1024.0 / max_dim
+                    proxy = cv2.resize(image_bgr, (int(w * scale_proxy), int(h * scale_proxy)))
+                    sharpness = calculate_sharpness(proxy)
+                else:
+                    sharpness = calculate_sharpness(image_bgr)
 
                 detected_faces = self.detector.detect_faces(image_bgr)
                 face_count = len(detected_faces)
@@ -146,8 +180,13 @@ class PhotoScannerService:
                             "thumbnail_path": str(thumb_path),
                             "is_primary": face.get('is_primary', True),
                             "area_ratio": face.get('area_ratio', 0.01),
-                            "sharpness": face_sharpness
+                            "sharpness": face_sharpness,
+                            "cluster_eligible": 1  # Will be re-evaluated below
                         }
+
+                        # Phase 1: Quality Gate — determine cluster eligibility
+                        face_rec["cluster_eligible"] = 1 if self._determine_cluster_eligibility(face_rec) else 0
+
                         face_records_for_db.append(face_rec)
                         all_extracted_faces.append(face_rec)
                     except Exception as e:
@@ -156,7 +195,7 @@ class PhotoScannerService:
                 if face_records_for_db:
                     self.db.save_faces(face_records_for_db)
 
-                if progress_callback:
+                if progress_callback and (idx % 10 == 0 or idx == total_files):
                     progress_callback({
                         "scanned_count": idx,
                         "total_files": total_files,
@@ -216,7 +255,11 @@ class PhotoScannerService:
 
     def recluster(self, distance_threshold: float = DEFAULT_COSINE_THRESHOLD) -> Dict[str, Any]:
         """
-        Globally re-cluster all stored face embeddings using two-stage agglomerative clustering.
+        Globally re-cluster all stored face embeddings using adaptive multi-pass clustering.
+        
+        Phase 1: Only cluster_eligible faces participate in automated clustering.
+        Phase 4: After clustering, re-apply saved manual merges so user corrections survive recluster.
+        
         Ensures 100% of detected faces are assigned to a person profile (no unassigned faces left behind).
         Picks the sharpest face as representative thumbnail.
         """
@@ -224,47 +267,89 @@ class PhotoScannerService:
         if not all_faces:
             return {"persons_count": 0}
 
-        # Filter faces with valid non-empty embeddings
-        valid_faces = [f for f in all_faces if isinstance(f.get('embedding'), np.ndarray) and f['embedding'].size > 0]
-        if not valid_faces:
-            valid_faces = all_faces
+        # ── Phase 1: Separate cluster-eligible vs ineligible faces ──
+        eligible_faces = []
+        ineligible_faces = []
+        for f in all_faces:
+            is_valid_emb = isinstance(f.get('embedding'), np.ndarray) and f['embedding'].size > 0
+            is_eligible = f.get('cluster_eligible', 1) == 1
+            if is_valid_emb and is_eligible:
+                eligible_faces.append(f)
+            else:
+                ineligible_faces.append(f)
 
         # Find target feature dimension (most common, e.g. 512D)
-        shapes = [f['embedding'].size for f in valid_faces if isinstance(f.get('embedding'), np.ndarray)]
+        shapes = [f['embedding'].size for f in eligible_faces if isinstance(f.get('embedding'), np.ndarray)]
         target_dim = max(set(shapes), key=shapes.count) if shapes else 512
 
         # Retain faces matching target dimension for clustering
-        clean_faces = [f for f in valid_faces if isinstance(f.get('embedding'), np.ndarray) and f['embedding'].size == target_dim]
+        clean_faces = [f for f in eligible_faces if isinstance(f.get('embedding'), np.ndarray) and f['embedding'].size == target_dim]
         embeddings = [f['embedding'] for f in clean_faces]
 
         labels = self.clusterer.cluster(embeddings, distance_threshold=distance_threshold) if clean_faces else []
 
-        # Clear existing foreign key references first
+        # ── Phase 4: Save existing manual merges BEFORE wiping ──
+        saved_merge_groups = self.db.get_merge_groups()
+
+        existing_persons = self.db.get_all_persons()
+        person_to_faces_old = {}
+        person_to_name_old = {}
+        for p in existing_persons:
+            person_to_name_old[p['person_id']] = p['display_name']
+            person_to_faces_old[p['person_id']] = set()
+        for f in all_faces:
+            if f.get('person_id'):
+                if f['person_id'] not in person_to_faces_old:
+                    person_to_faces_old[f['person_id']] = set()
+                person_to_faces_old[f['person_id']].add(f['face_id'])
+
+        # Clear existing foreign key references
         conn = self.db.get_connection()
         with conn:
             conn.execute("UPDATE faces SET person_id = NULL;")
-            conn.execute("DELETE FROM merge_groups;")
             conn.execute("DELETE FROM persons;")
+            # NOTE: We do NOT delete merge_groups — we preserve them for re-application
         conn.close()
 
         # Group faces by cluster label
         clusters: Dict[int, List[Dict[str, Any]]] = {}
         for face_rec, label in zip(clean_faces, labels):
+            if label < 0:
+                # Clusterer returned -1 for invalid/filtered faces — treat as unclustered
+                ineligible_faces.append(face_rec)
+                continue
             clusters.setdefault(label, []).append(face_rec)
 
-        # Ensure any unassigned / fallback faces get standalone person profiles (zero faces dropped)
-        clustered_face_ids = {f['face_id'] for f in clean_faces}
-        unclustered_faces = [f for f in all_faces if f['face_id'] not in clustered_face_ids]
+        # Also add eligible faces that didn't make it into clean_faces (dimension mismatch)
+        clustered_face_ids = {f['face_id'] for f_list in clusters.values() for f in f_list}
+        for f in eligible_faces:
+            if f['face_id'] not in clustered_face_ids and f not in ineligible_faces:
+                ineligible_faces.append(f)
 
+        # Create person profiles from clusters
         next_label = max(clusters.keys()) + 1 if clusters else 0
-        for f in unclustered_faces:
-            clusters[next_label] = [f]
-            next_label += 1
-
         persons_summary = []
+        face_to_person: Dict[str, str] = {}  # face_id -> person_id mapping
+
         for cluster_label, face_list in clusters.items():
             person_id = f"Person_{cluster_label + 1}"
             display_name = f"Person {cluster_label + 1}"
+
+            new_face_ids = set(f['face_id'] for f in face_list)
+            best_overlap = 0.0
+            best_prev_name = None
+            for prev_pid, prev_faces in person_to_faces_old.items():
+                if not prev_faces:
+                    continue
+                intersection = new_face_ids.intersection(prev_faces)
+                union = new_face_ids.union(prev_faces)
+                overlap = len(intersection) / len(union) if union else 0
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_prev_name = person_to_name_old.get(prev_pid)
+                    
+            if best_overlap > 0.30 and best_prev_name:
+                display_name = best_prev_name
 
             # Pick sharpest face as representative thumbnail
             def face_score(f):
@@ -283,6 +368,7 @@ class PhotoScannerService:
             # Update faces to reference the newly saved person
             for f in face_list:
                 self.db.update_face_person(f['face_id'], person_id)
+                face_to_person[f['face_id']] = person_id
 
             persons_summary.append({
                 "person_id": person_id,
@@ -291,4 +377,119 @@ class PhotoScannerService:
                 "face_count": face_count
             })
 
-        return {"persons_count": len(persons_summary)}
+        # ── Assign ineligible faces to nearest cluster centroid or to Crowd ──
+        if ineligible_faces:
+            crowd_person_id = "Person_Crowd"
+            crowd_display_name = "Unassigned / Crowd"
+            crowd_faces = []
+
+            cluster_centroids = {}
+            if clusters:
+                for cluster_label, face_list in clusters.items():
+                    person_id = f"Person_{cluster_label + 1}"
+                    embs = [f['embedding'].flatten() for f in face_list if isinstance(f.get('embedding'), np.ndarray) and f['embedding'].size == target_dim]
+                    if embs:
+                        c = np.mean(embs, axis=0).astype(np.float32)
+                        c_norm = np.linalg.norm(c)
+                        if c_norm > 0:
+                            c = c / c_norm
+                        cluster_centroids[person_id] = c
+
+            for f in ineligible_faces:
+                if not isinstance(f.get('embedding'), np.ndarray) or f['embedding'].size != target_dim:
+                    crowd_faces.append(f)
+                    continue
+
+                emb = f['embedding'].flatten().astype(np.float32)
+                emb_norm = np.linalg.norm(emb)
+                if emb_norm > 0:
+                    emb = emb / emb_norm
+
+                best_person = None
+                best_dist = float('inf')
+                for person_id, centroid in cluster_centroids.items():
+                    dist = 1.0 - float(np.dot(emb, centroid))
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_person = person_id
+
+                # Only assign if within a reasonable distance (use the user threshold)
+                if best_person and best_dist <= distance_threshold:
+                    self.db.update_face_person(f['face_id'], best_person)
+                    face_to_person[f['face_id']] = best_person
+                    # Update person face count
+                    conn = self.db.get_connection()
+                    with conn:
+                        cur = conn.execute("SELECT COUNT(*) FROM faces WHERE person_id = ?", (best_person,))
+                        cnt = cur.fetchone()[0]
+                        conn.execute("UPDATE persons SET face_count = ? WHERE person_id = ?", (cnt, best_person))
+                    conn.close()
+                else:
+                    crowd_faces.append(f)
+
+            if crowd_faces:
+                crowd_thumbnail = crowd_faces[0].get('thumbnail_path', '')
+                self.db.save_person(crowd_person_id, crowd_display_name, crowd_thumbnail, len(crowd_faces))
+                for f in crowd_faces:
+                    self.db.update_face_person(f['face_id'], crowd_person_id)
+                    face_to_person[f['face_id']] = crowd_person_id
+
+        # ── Phase 4: Re-apply saved manual merges ──
+        if saved_merge_groups:
+            import json
+            for mg in saved_merge_groups:
+                target_pid = mg.get('target_person_id')
+                source_pid = mg.get('source_person_id')
+                face_ids_json = mg.get('face_ids_json', '[]')
+
+                try:
+                    face_ids = json.loads(face_ids_json) if face_ids_json else []
+                except Exception:
+                    face_ids = []
+
+                if not target_pid or not face_ids:
+                    continue
+
+                # Check if the target person still exists after re-clustering
+                conn = self.db.get_connection()
+                cur = conn.execute("SELECT person_id FROM persons WHERE person_id = ?", (target_pid,))
+                target_exists = cur.fetchone() is not None
+                conn.close()
+
+                if not target_exists:
+                    # The target person may have been renumbered — try to find by checking
+                    # which person currently owns most of target's original faces
+                    # Skip this merge if we can't find the target
+                    continue
+
+                # Move the faces back to the merge target
+                for fid in face_ids:
+                    conn = self.db.get_connection()
+                    cur = conn.execute("SELECT person_id FROM faces WHERE face_id = ?", (fid,))
+                    row = cur.fetchone()
+                    conn.close()
+
+                    if row and row['person_id'] and row['person_id'] != target_pid:
+                        old_pid = row['person_id']
+                        self.db.update_face_person(fid, target_pid)
+
+                        # Clean up the old person if it's now empty
+                        conn = self.db.get_connection()
+                        with conn:
+                            cur = conn.execute("SELECT COUNT(*) FROM faces WHERE person_id = ?", (old_pid,))
+                            cnt = cur.fetchone()[0]
+                            if cnt == 0:
+                                conn.execute("DELETE FROM persons WHERE person_id = ?", (old_pid,))
+                            else:
+                                conn.execute("UPDATE persons SET face_count = ? WHERE person_id = ?", (cnt, old_pid))
+                        conn.close()
+
+                # Update target person face count
+                conn = self.db.get_connection()
+                with conn:
+                    cur = conn.execute("SELECT COUNT(*) FROM faces WHERE person_id = ?", (target_pid,))
+                    cnt = cur.fetchone()[0]
+                    conn.execute("UPDATE persons SET face_count = ? WHERE person_id = ?", (cnt, target_pid))
+                conn.close()
+
+        return {"persons_count": len(self.db.get_all_persons())}

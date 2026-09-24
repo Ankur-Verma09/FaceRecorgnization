@@ -30,12 +30,10 @@ export default function Sidebar({ activeTab, setActiveTab, stats = {} }) {
         {/* App / Profile Header Section */}
         <div className="px-6 py-6 text-center border-b border-slate-800/60">
           <div className="relative inline-block mb-3">
-            <div className="w-20 h-20 rounded-full p-1 bg-gradient-to-tr from-cyan-400 via-blue-500 to-purple-600 shadow-xl shadow-cyan-500/20 mx-auto">
-              <img
-                src="https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=300&q=80"
-                alt="AI Agent Profile"
-                className="w-full h-full object-cover rounded-full"
-              />
+            <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-cyan-400 via-blue-500 to-purple-600 shadow-xl shadow-cyan-500/20 mx-auto flex items-center justify-center p-1">
+              <div className="w-full h-full rounded-full bg-slate-900 flex items-center justify-center">
+                <User className="w-10 h-10 text-cyan-400" />
+              </div>
             </div>
             <span className="absolute bottom-1 right-1 w-4 h-4 rounded-full bg-emerald-500 border-2 border-slate-900 shadow-md" title="Offline AI Active"></span>
           </div>
